@@ -1,0 +1,6 @@
+/poc_xerces_rce
+/tmp/
+*.o
+*.so
+*.out
+.DS_Store
