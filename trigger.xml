@@ -1,2 +1,1 @@
-<!DOCTYPE r [<!ELEMENT r ANY><!ENTITY% pe1 ">D><r>hello">
- %pe1;
+<AAAAAAAA attr0000000="x" other="y"/>

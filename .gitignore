@@ -1,4 +1,7 @@
 /poc_xerces_rce
+/gen_uaf3
+/final_input.bin
+/uaf3_grammar.bin
 /tmp/
 *.o
 *.so

@@ -1,133 +1,88 @@
-# Xerces-C++ PE Entity UAF RCE PoC
+# Xerces-C++ serialized grammar reload RCE PoC
 
-Tiny proof harness for Apache Xerces-C++ at commit
+tiny proof package for Apache Xerces-C++ at commit
 `53c0401812bfe5523594c1180f5ac7c758a2eaf7`.
 
-The bug is a parameter-entity lifetime mismatch! Xerces keeps a PE entity pointer in
-`ReaderMgr` after `DTDScanner` frees the PE declaration pool. The PoC uses a normal advanced
-document handler callback window to reclaim the freed entity slot, then reaches a virtual method
-through the stale `XMLEntityDecl&` delivered by Xerces.
+this is the final stock-only PoC for the ctf challenge. it does **not** rely on a custom reclaimed object or an instrumented Xerces build.
 
-The payload writes `/tmp/xerces_uaf_rce_proof` and exits with
-`42`.
+the exploit starts from a **valid serialized schema grammar**, mutates the object graph so an adopted container frees a `SchemaAttDef` while its object id stays reachable in the deserialize load pool, then reclaims that freed chunk with a later `QName.local` string allocation. a mutated `SchemaElementDecl::fAttWildCard` points at the dangling id, and stock Xerces eventually performs a virtual `delete` through the reclaimed bytes.
 
-## Status
+the proof writes `/tmp/xerces_serialized_rce_proof` and exits with `42`.
 
-Verified locally against an unmodified checkout at the pinned commit.
+## files
 
-```text
-commit: 53c0401812bfe5523594c1180f5ac7c758a2eaf7
-tracked diff under src/xercesc: 0 bytes
-result: rc=42, proof=xerces-uaf-rce
-```
+- `poc_xerces_rce.cpp` - final stock-api trigger program
+- `gen_uaf3.cpp` - generates the valid serialized grammar base
+- `build_final_input.py` - mutates the valid grammar into the final proof input
+- `trigger.xml` - instance parsed after grammar reload
+- `build.sh` - builds the helper binaries against a local stock Xerces build
+- `run.sh` - generates the proof input, runs it, and checks the marker file
 
-## Files
+## build
 
-- `poc_xerces_rce.cpp` - standalone proof harness
-- `trigger.xml` - the XML shape used by the harness
-- `build.sh` - builds against a local Xerces checkout/build
-- `run.sh` - runs the proof and checks the marker file
-
-## Trigger
-
-```xml
-<!DOCTYPE r [<!ELEMENT r ANY><!ENTITY% pe1 ">D><r>hello">
- %pe1;
-```
-
-`>D><r>hello` makes DTD scanning recover in a way that leaves the PE reader
-alive after `DTDScanner` is destroyed, then continues into document content from that reader
-
-## Build
-
-Point the script at the pinned Xerces source checkout and build dir:
+point the script at the pinned Xerces checkout and build dir:
 
 ```bash
-XERCES_SRC=/path/to/xerces-c \
-XERCES_BUILD=/path/to/xerces-build \
+XERCES_SRC=/path/to/xerces-c-stock-clean \
+XERCES_BUILD=/path/to/xerces-c-stock-build \
 ./build.sh
 ```
 
-the script links directly against:
+expected files:
 
-```text
-$XERCES_BUILD/src/libxerces-c-4.0.so
-```
+- `$XERCES_SRC/src/xercesc/parsers/XercesDOMParser.hpp`
+- `$XERCES_BUILD/src/libxerces-c-4.0.so`
 
-## Run
+## run
 
 ```bash
-./run.sh
+XERCES_BUILD=/path/to/xerces-c-stock-build ./run.sh
 ```
 
-Expected output shape:
+expected output shape:
 
 ```text
-[*] endEntityReference dangling entity=0x..., first reclaim=0x...
-[+] control flow reached ReclaimedEntity::getIsParameter, this=0x...
+deserialized
+parsed
+[+] xerces rce
 rc=42
-proof=xerces-uaf-rce
+proof=xerces-serialized-rce
 [+] code execution proof hit
 ```
 
-## Required Parser Setup
+## required parser setup
 
-The proof uses public Xerces APIs only:
+the proof uses public Xerces APIs only:
 
 ```cpp
-parser.setValidationScheme(SAXParser::Val_Auto);
+parser.setValidationScheme(XercesDOMParser::Val_Always);
 parser.setDoNamespaces(true);
-parser.setExitOnFirstFatalError(false);
-parser.setValidationConstraintFatal(false);
-parser.installAdvDocHandler(&docHandler);
-parser.setErrorHandler(&errHandler);
+parser.setDoSchema(true);
+parser.useCachedGrammarInParse(true);
+parser.setValidationSchemaFullChecking(true);
 ```
 
-`setExitOnFirstFatalError(false)` is needed so the malformed DTD path keeps going long enough to
-reach the propagated PE content. `installAdvDocHandler()` is the public advanced document handler API
-that receives `endEntityReference()`.
+`cacheGrammarFromParse(true)` is used while generating the valid serialized grammar.
 
-## Why It Works
+## root cause summary
 
-1. `DTDScanner::expandPERef()` pushes the PE reader with a non-adopted entity pointer:
+1. start from a valid serialized schema grammar
+2. mutate two `SchemaAttDef` names inside the same adopted `RefHash2KeysTableOf<SchemaAttDef>` so they collide
+3. during `RefHash2KeysTableOf::put()`, the second insert frees the first `SchemaAttDef` (`id=15`)
+4. the freed object id still remains reachable through the deserialize load pool
+5. a later `QName.local` allocation with `bufferLen=56` reuses the exact freed `SchemaAttDef` chunk
+6. mutate `SchemaElementDecl::fAttWildCard` to reference object id `15`
+7. stock Xerces later executes `delete fAttWildCard`, which dispatches through the reclaimed bytes as a fake vtable
+8. control flow reaches the proof function in the non-PIE trigger binary
 
-   ```cpp
-   fReaderMgr->pushReader(reader, decl);
-   ```
+## why this follows the ctf rules
 
-2. `decl` is still owned by `DTDScanner::fPEntityDeclPool`.
-3. `DTDScanner::~DTDScanner()` frees the PE `DTDEntityDecl` while `ReaderMgr` still reference it
-4. Parsing continues from the propagated PE reader and calls `docCharacters()`
-5. The PoC allocates same-size `XMemory` objects in that callback and reclaims the freed entity slot
-6. PE end-of-entity throws `EndOfEntityException` with the stale pointer
-7. `IGXMLScanner::scanContent()` forwards the stale reference:
+- stock upstream Xerces is unmodified in the final proof
+- the input starts from a valid serialized grammar
+- the trigger uses grammar caching / serialized grammar reload, not only plain XML parsing
+- the effect is real code execution, not just a crash or parser exception
+- the final proof does not depend on a custom reclaimed C++ object inside the exploit path
 
-   ```cpp
-   fDocHandler->endEntityReference(toCatch.getEntity());
-   ```
+## note on the input file
 
-8. A virtual call on that `XMLEntityDecl&` dispatches through the reclaimed objects vtable
-
-## Why RCE?
-
-The proof reaches a valid virtual method on the reclaimed object:
-
-```text
-ReclaimedEntity::getIsParameter()
-```
-
-That method writes a marker file through `system()`:
-
-```text
-/tmp/xerces_uaf_rce_proof = xerces-uaf-rce
-```
-
-The process exits with `42` only if that virtual method was reached.
-
-## Limits
-
-This is a harness proof, not a universal exploit for every Xerces consumer. The target application
-needs to use the advanced document handler path and query entity metadata in `endEntityReference()`.
-Xerces itself is unmodified: the UAF, stale reference,
-callback ordering, reclaim window, and final dispatch all happen against stock Xerces-C++ at the
-pinned commit
+`final_input.bin` is generated at run time because the fake vtable pointer must match the fixed address of `fake_vtable` in the non-PIE proof binary.
